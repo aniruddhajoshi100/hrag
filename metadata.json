@@ -1,0 +1,17 @@
+{
+  "p1.pdf": {
+    "author": "Alice Scholar",
+    "year": 2023,
+    "topic": "Machine Learning"
+  },
+  "p2.pdf": {
+    "author": "Bob Researcher",
+    "year": 2024,
+    "topic": "Natural Language Processing"
+  },
+  "p3.pdf": {
+    "author": "Charlie Academic",
+    "year": 2022,
+    "topic": "Computer Vision"
+  }
+}
