@@ -60,7 +60,8 @@ def build_chain(llm, vectorstore, search_kwargs):
         Answer:"""
     )
     
-    retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
+    # Use Maximal Marginal Relevance (MMR) to diversify results and avoid duplicate chunks
+    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
     document_chain = create_stuff_documents_chain(llm, prompt)
     retrieval_chain = create_retrieval_chain(retriever, document_chain)
     return retrieval_chain
