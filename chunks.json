@@ -309,7 +309,7 @@
   },
   {
     "type": "text",
-    "text": "\u2018To illustrate why the dot products get large, assume that the components of q and k are independent random variables with mean 0 and variance 1. Then their dot product, g -k = re, qiki, has mean 0 and variance d,.",
+    "text": "\u2018To illustrate why the dot products get large, assume that the components of qg and k are independent random variables with mean 0 and variance 1. Then their dot product, g -k = ean qik;, has mean 0 and variance d,.",
     "metadata": {
       "source": "p1.pdf",
       "section": "3.2.2 Multi-Head Attention",
@@ -1783,7 +1783,7 @@
   },
   {
     "type": "text",
-    "text": "For parameter updates only the gradient with respect to the error for the adapters weights \u2202E are \u2202Li \u2202W. However, the calculation of \u2202E entails the calculation of \u2202X needed, and not for 4-bit weights \u2202E \u2202W \u2202Li which proceeds via equation (5) with dequantization from storage WNF4 to computation data type WBF16 to calculate the derivative \u2202X \u2202W in BFloat16 precision.",
+    "text": "For parameter updates only the gradient with respect to the error for the adapters weights \u2202E are \u2202Li needed, and not for 4-bit weights \u2202E \u2202W. However, the calculation of \u2202E entails the calculation of \u2202X \u2202Li \u2202W which proceeds via equation (5) with dequantization from storage WNF4 to computation data type WBF16 to calculate the derivative \u2202X \u2202W in BFloat16 precision.",
     "metadata": {
       "source": "p2.pdf",
       "section": "3 QLORA Finetuning",

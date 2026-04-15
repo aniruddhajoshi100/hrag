@@ -67,7 +67,7 @@ def build_chain(llm, vectorstore, search_kwargs):
     return retrieval_chain
 
 # --- Main App Logic ---
-st.title("📚 Hierarchical RAG for Academic Documents")
+st.title(" Hierarchical RAG for Academic Documents")
 st.markdown("Search across papers and filter specifically by their section context, author, year, or topic.")
 
 vectorstore = load_vectorstore()
