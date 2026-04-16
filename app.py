@@ -1,6 +1,5 @@
 import os
 from typing import Any
-from enum import Enum
 from dotenv import load_dotenv
 import streamlit as st
 from pydantic import BaseModel, Field, SecretStr
@@ -20,33 +19,12 @@ COLLECTION_NAME = "academic_papers"
 
 env_api_key = os.getenv("GROQ_API_KEY", "")
 
-# --- 1. STRICT MULTIPLE CHOICE (The Enum) ---
-# We force the LLM to pick one of these exact keys. It cannot invent new strings.
-class PaperKey(str, Enum):
-    qlora = "qlora"
-    attention = "attention"
-    chain_of_thought = "chain_of_thought"
-    unknown = "unknown"
-
-# --- 2. THE ALIAS MAPPER ---
-# Now it maps the strict Enum keys directly to your exact filenames
-PAPER_ALIASES = {
-    PaperKey.attention: "p1.pdf",
-    PaperKey.qlora: "p2.pdf",
-    PaperKey.chain_of_thought: "p3.pdf"
-}
-
-# --- 3. THE STRICT AI SCHEMA ---
+# --- 1. DYNAMIC ROUTER SCHEMA ---
 class SearchFilters(BaseModel):
     """Schema for extracting metadata filters from a user's natural language query."""
-    target_source: PaperKey = Field(
-        default=PaperKey.unknown, 
-        description="Identify which specific paper is being asked about. Select from the provided enum list. If no specific paper is mentioned, select 'unknown'."
-    )
-    # We keep target_section so the AI extracts it, but we won't force ChromaDB to hard-filter by it.
-    target_section: str | None = Field(
+    target_title: str | None = Field(
         default=None, 
-        description="The specific section of the paper mentioned. If no section is mentioned, return None."
+        description="Identify which specific paper is being asked about. MUST exactly match one of the titles provided in the system prompt. If no specific paper is mentioned, return None."
     )
 
 # --- Sidebar Configuration ---
@@ -61,17 +39,26 @@ model_name = st.sidebar.selectbox("LLM Model", ["llama-3.1-8b-instant", "llama-3
 
 # --- Core RAG Setup Functions ---
 @st.cache_resource
-def load_vectorstore():
+def load_vectorstore_and_titles():
+    """Loads the vectorstore and dynamically extracts all unique paper titles from the database."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     if not os.path.exists(CHROMA_DB_DIR):
-        return None
+        return None, []
     db = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings, collection_name=COLLECTION_NAME)
-    return db
+    
+    # Scan the metadata of all chunks to find unique titles
+    try:
+        data = db.get(include=["metadatas"])
+        unique_titles = list(set(meta.get("title") for meta in data["metadatas"] if meta and "title" in meta))
+    except Exception:
+        unique_titles = []
+        
+    return db, unique_titles
 
 def build_chain(llm, vectorstore, search_kwargs):
     prompt = ChatPromptTemplate.from_template(
         """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
-        Each piece of context includes its hierarchical path (Source File -> Section). Pay close attention to this path to understand where the information comes from.
+        Each piece of context includes its hierarchical path (Title -> Section). Pay close attention to this path to understand where the information comes from.
         
         If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
         
@@ -83,9 +70,10 @@ def build_chain(llm, vectorstore, search_kwargs):
         Answer:"""
     )
     
+    # Notice we updated the input variables to use your new 'title' metadata field!
     document_prompt = PromptTemplate(
-        input_variables=["page_content", "source", "section"],
-        template="[PATH: {source} -> {section}]\n{page_content}\n"
+        input_variables=["page_content", "title", "section"],
+        template="[PATH: {title} -> {section}]\n{page_content}\n"
     )
     
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
@@ -101,9 +89,10 @@ def build_chain(llm, vectorstore, search_kwargs):
 
 # --- Main App Logic ---
 st.title("Hierarchical RAG for Academic Documents")
-st.markdown("Search across papers. The AI will automatically detect if you are asking about a specific section or paper.")
+st.markdown("Search across papers. The AI will automatically route using metadata titles instead of generic filenames.")
 
-vectorstore = load_vectorstore()
+# Fetch both the database AND the list of valid titles
+vectorstore, unique_titles = load_vectorstore_and_titles()
 
 if not vectorstore:
     st.warning("No Vector Database found. Please make sure you have run the ingestion script first to generate `./chroma_db`.")
@@ -123,25 +112,35 @@ if st.button("Search & Generate") and query:
                 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model=model_name)
                 
                 # 2. The Intelligent Router Step
-                structured_llm = llm.with_structured_output(SearchFilters)
-                extracted_filters = structured_llm.invoke(query)
+                # Dynamically inject the exact database titles into the Router's instructions
+                valid_titles_str = "\n".join([f"- {t}" for t in unique_titles])
+                router_system_prompt = f"""You are an intelligent routing agent. Your job is to extract the target paper title from the user's query.
+                You MUST select EXACTLY from this list of valid paper titles (or return None if the query is general):
+                {valid_titles_str}
+                """
                 
-                # --- 3. THE ENUM FILTER LOGIC ---
+                router_prompt = ChatPromptTemplate.from_messages(
+                    [
+                        ("system", router_system_prompt),
+                        ("user", "{query}"),
+                    ]
+                )
+                
+                structured_llm = router_prompt | llm.with_structured_output(SearchFilters)
+                extracted_filters = structured_llm.invoke({"query": query})
+                
+                # --- 3. DYNAMIC METADATA FILTER LOGIC ---
                 chroma_filter = {}
 
-                # If the AI successfully picked a known paper...
-                if extracted_filters.target_source != PaperKey.unknown:
-                    # Get the exact filename from our alias dictionary
-                    mapped_source = PAPER_ALIASES.get(extracted_filters.target_source)
-                    
-                    if mapped_source:
-                        chroma_filter["source"] = mapped_source 
+                # If the AI successfully picked a known title from the DB
+                if extracted_filters.target_title and extracted_filters.target_title in unique_titles:
+                    chroma_filter["title"] = extracted_filters.target_title 
 
                 # Configure initial search kwargs
-                search_kwargs: dict[str, Any] = {"k": 10, "fetch_k": 30} # MMR Needs fetch_k to be higher!
+                search_kwargs: dict[str, Any] = {"k": 10} 
                 if chroma_filter:
                     search_kwargs["filter"] = chroma_filter 
-                    st.success(f"🤖 AI Auto-Filtered by exact source: {chroma_filter}")
+                    st.success(f"🤖 AI Auto-Filtered by exact title: {chroma_filter}")
                 else:
                     st.info("🤖 Executing global vector search.")
                     
@@ -164,8 +163,8 @@ if st.button("Search & Generate") and query:
                 
                 st.markdown("### Source Evidence Retrieved")
                 for i, doc in enumerate(response["context"]):
-                    # Reverted to generic 'Unknown File' to avoid system identifiers
-                    with st.expander(f"Source {i+1}: {doc.metadata.get('source', 'Unknown File')} | Section: {doc.metadata.get('section', 'Main Text')}"):
+                    # Show the actual title instead of 'p1.pdf' in the UI expander
+                    with st.expander(f"Source {i+1}: {doc.metadata.get('title', 'Unknown Title')} | Section: {doc.metadata.get('section', 'Main Text')}"):
                         st.json(doc.metadata)  
                         st.write(doc.page_content) 
                         

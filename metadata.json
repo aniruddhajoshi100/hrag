@@ -1,15 +1,18 @@
 {
   "p1.pdf": {
+    "title": "Attention Is All You Need",
     "author": "Alice Scholar",
     "year": 2023,
     "topic": "Machine Learning"
   },
   "p2.pdf": {
+    "title": "QLoRA: Efficient Finetuning of Quantized LLMs",
     "author": "Bob Researcher",
     "year": 2024,
     "topic": "Natural Language Processing"
   },
   "p3.pdf": {
+    "title": "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models",
     "author": "Charlie Academic",
     "year": 2022,
     "topic": "Computer Vision"
