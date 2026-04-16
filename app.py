@@ -1,16 +1,17 @@
 import os
 from typing import Any
+from enum import Enum
 from dotenv import load_dotenv
 import streamlit as st
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-load_dotenv()
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 
+load_dotenv()
 
 st.set_page_config(page_title="Academic RAG Explorer", layout="wide")
 
@@ -18,6 +19,35 @@ CHROMA_DB_DIR = "./chroma_db"
 COLLECTION_NAME = "academic_papers"
 
 env_api_key = os.getenv("GROQ_API_KEY", "")
+
+# --- 1. STRICT MULTIPLE CHOICE (The Enum) ---
+# We force the LLM to pick one of these exact keys. It cannot invent new strings.
+class PaperKey(str, Enum):
+    qlora = "qlora"
+    attention = "attention"
+    chain_of_thought = "chain_of_thought"
+    unknown = "unknown"
+
+# --- 2. THE ALIAS MAPPER ---
+# Now it maps the strict Enum keys directly to your exact filenames
+PAPER_ALIASES = {
+    PaperKey.attention: "p1.pdf",
+    PaperKey.qlora: "p2.pdf",
+    PaperKey.chain_of_thought: "p3.pdf"
+}
+
+# --- 3. THE STRICT AI SCHEMA ---
+class SearchFilters(BaseModel):
+    """Schema for extracting metadata filters from a user's natural language query."""
+    target_source: PaperKey = Field(
+        default=PaperKey.unknown, 
+        description="Identify which specific paper is being asked about. Select from the provided enum list. If no specific paper is mentioned, select 'unknown'."
+    )
+    # We keep target_section so the AI extracts it, but we won't force ChromaDB to hard-filter by it.
+    target_section: str | None = Field(
+        default=None, 
+        description="The specific section of the paper mentioned. If no section is mentioned, return None."
+    )
 
 # --- Sidebar Configuration ---
 st.sidebar.title("RAG Settings")
@@ -29,17 +59,9 @@ else:
 
 model_name = st.sidebar.selectbox("LLM Model", ["llama-3.1-8b-instant", "llama-3.1-70b-versatile", "mixtral-8x7b-32768"])
 
-# Sidebar Metadata Filters
-st.sidebar.markdown("### Metadata Filters")
-author_filter = st.sidebar.selectbox("Author", ["Any", "Alice Scholar", "Bob Researcher", "Charlie Academic"])
-year_filter = st.sidebar.selectbox("Year", ["Any", 2022, 2023, 2024])
-topic_filter = st.sidebar.selectbox("Topic", ["Any", "Machine Learning", "Natural Language Processing", "Computer Vision"])
-
 # --- Core RAG Setup Functions ---
 @st.cache_resource
 def load_vectorstore():
-    # Use the same free local embedding model
-    st.write("Loading embeddings...")
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     if not os.path.exists(CHROMA_DB_DIR):
         return None
@@ -47,10 +69,11 @@ def load_vectorstore():
     return db
 
 def build_chain(llm, vectorstore, search_kwargs):
-    # Combine user query explicitly to the LLM alongside retrieved context
     prompt = ChatPromptTemplate.from_template(
-        """You are a helpful academic research assistant. Use the following context from academic papers to answer the query accurately. 
-        If you cannot find the answer in the context, say "I don't know based on the provided papers."
+        """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
+        Each piece of context includes its hierarchical path (Source File -> Section). Pay close attention to this path to understand where the information comes from.
+        
+        If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
         
         Context:
         {context}
@@ -60,32 +83,33 @@ def build_chain(llm, vectorstore, search_kwargs):
         Answer:"""
     )
     
-    # Use Maximal Marginal Relevance (MMR) to diversify results and avoid duplicate chunks
-    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
-    document_chain = create_stuff_documents_chain(llm, prompt)
+    document_prompt = PromptTemplate(
+        input_variables=["page_content", "source", "section"],
+        template="[PATH: {source} -> {section}]\n{page_content}\n"
+    )
+    
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
+    
+    document_chain = create_stuff_documents_chain(
+        llm=llm, 
+        prompt=prompt,
+        document_prompt=document_prompt 
+    )
+    
     retrieval_chain = create_retrieval_chain(retriever, document_chain)
     return retrieval_chain
 
 # --- Main App Logic ---
-st.title("📚 Hierarchical RAG for Academic Documents")
-st.markdown("Search across papers and filter specifically by their section context, author, year, or topic.")
+st.title("Hierarchical RAG for Academic Documents")
+st.markdown("Search across papers. The AI will automatically detect if you are asking about a specific section or paper.")
 
 vectorstore = load_vectorstore()
 
 if not vectorstore:
-    st.warning("No Vector Database found. Please make sure you have run `embed_index.py` first to generate `./chroma_db`.")
+    st.warning("No Vector Database found. Please make sure you have run the ingestion script first to generate `./chroma_db`.")
     st.stop()
 
-# Build the filter dict dynamically from sidebar selections
-chroma_filter = {}
-if author_filter != "Any":
-    chroma_filter["author"] = author_filter
-if year_filter != "Any":
-    chroma_filter["year"] = int(year_filter)
-if topic_filter != "Any":
-    chroma_filter["topic"] = topic_filter
-
-query = st.text_input("Ask a question about the papers:")
+query = st.text_input("Ask a technical question about the papers:")
 
 if st.button("Search & Generate") and query:
     if not groq_api_key.strip():
@@ -93,32 +117,57 @@ if st.button("Search & Generate") and query:
     elif not vectorstore:
         st.error("Vector database is unavailable.")
     else:
-        with st.spinner("Searching and generating answer..."):
+        with st.spinner("Analyzing query and extracting routing filters..."):
             try:
                 # 1. Initialize Groq Client
-                llm = ChatGroq(temperature=0.2, api_key=SecretStr(groq_api_key), model=model_name)
+                llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model=model_name)
                 
-                # 2. Configure kwargs for LangChain's Chroma Retriever
-                search_kwargs: dict[str, Any] = {"k": 3}
+                # 2. The Intelligent Router Step
+                structured_llm = llm.with_structured_output(SearchFilters)
+                extracted_filters = structured_llm.invoke(query)
+                
+                # --- 3. THE ENUM FILTER LOGIC ---
+                chroma_filter = {}
+
+                # If the AI successfully picked a known paper...
+                if extracted_filters.target_source != PaperKey.unknown:
+                    # Get the exact filename from our alias dictionary
+                    mapped_source = PAPER_ALIASES.get(extracted_filters.target_source)
+                    
+                    if mapped_source:
+                        chroma_filter["source"] = mapped_source 
+
+                # Configure initial search kwargs
+                search_kwargs: dict[str, Any] = {"k": 10} 
                 if chroma_filter:
-                    search_kwargs["filter"] = chroma_filter
-                    st.info(f"Filtering context by: {chroma_filter}")
+                    search_kwargs["filter"] = chroma_filter 
+                    st.success(f"🤖 AI Auto-Filtered by exact source: {chroma_filter}")
                 else:
-                    st.info("Searching all papers without metadata filters.")
+                    st.info("🤖 Executing global vector search.")
+                    
+                # --- THE SAFETY NET ---
+                test_retriever = vectorstore.as_retriever(search_kwargs={"k": 1, "filter": chroma_filter})
+                if chroma_filter and len(test_retriever.invoke(query)) == 0:
+                    st.warning(f"⚠️ Could not find exact match for {chroma_filter} in database. Falling back to global search...")
+                    search_kwargs.pop("filter", None)
+                # ----------------------------------------
                 
-                # 3. Create the Chain and generate
+                st.spinner("Executing search and generating answer...")
+                
+                # 4. Create the Chain and generate
                 chain = build_chain(llm, vectorstore, search_kwargs)
                 response = chain.invoke({"input": query})
                 
-                # 4. Display Results
+                # 5. Display Results
                 st.markdown("### Answer")
                 st.write(response["answer"])
                 
-                st.markdown("### Source Context Retrieved")
+                st.markdown("### Source Evidence Retrieved")
                 for i, doc in enumerate(response["context"]):
-                    with st.expander(f"Source {i+1}: {doc.metadata.get('source', 'Unknown')} - {doc.metadata.get('section', 'Main')}"):
-                        st.json(doc.metadata)  # Show the metadata (Year, Author, Topic)
-                        st.write(doc.page_content[:500] + "...") # Show snippet of the text
+                    # Reverted to generic 'Unknown File' to avoid system identifiers
+                    with st.expander(f"Source {i+1}: {doc.metadata.get('source', 'Unknown File')} | Section: {doc.metadata.get('section', 'Main Text')}"):
+                        st.json(doc.metadata)  
+                        st.write(doc.page_content) 
                         
             except Exception as e:
                 st.error(f"An error occurred during query execution: {e}")
