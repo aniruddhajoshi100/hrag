@@ -1,15 +1,15 @@
 import os
 from typing import Any
-from enum import Enum
 from dotenv import load_dotenv
 import streamlit as st
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import SecretStr
 from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from rag_schema import PaperKey, PAPER_ALIASES, SearchFilters, ROUTER_SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -19,35 +19,6 @@ CHROMA_DB_DIR = "./chroma_db"
 COLLECTION_NAME = "academic_papers"
 
 env_api_key = os.getenv("GROQ_API_KEY", "")
-
-# --- 1. STRICT MULTIPLE CHOICE (The Enum) ---
-# We force the LLM to pick one of these exact keys. It cannot invent new strings.
-class PaperKey(str, Enum):
-    qlora = "qlora"
-    attention = "attention"
-    chain_of_thought = "chain_of_thought"
-    unknown = "unknown"
-
-# --- 2. THE ALIAS MAPPER ---
-# Now it maps the strict Enum keys directly to your exact filenames
-PAPER_ALIASES = {
-    PaperKey.attention: "p1.pdf",
-    PaperKey.qlora: "p2.pdf",
-    PaperKey.chain_of_thought: "p3.pdf"
-}
-
-# --- 3. THE STRICT AI SCHEMA ---
-class SearchFilters(BaseModel):
-    """Schema for extracting metadata filters from a user's natural language query."""
-    target_source: PaperKey = Field(
-        default=PaperKey.unknown, 
-        description="Identify which specific paper is being asked about. Select from the provided enum list. If no specific paper is mentioned, select 'unknown'."
-    )
-    # We keep target_section so the AI extracts it, but we won't force ChromaDB to hard-filter by it.
-    target_section: str | None = Field(
-        default=None, 
-        description="The specific section of the paper mentioned. If no section is mentioned, return None."
-    )
 
 # --- Sidebar Configuration ---
 st.sidebar.title("RAG Settings")
@@ -123,8 +94,14 @@ if st.button("Search & Generate") and query:
                 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model=model_name)
                 
                 # 2. The Intelligent Router Step
-                structured_llm = llm.with_structured_output(SearchFilters)
-                extracted_filters = structured_llm.invoke(query)
+                router_prompt = ChatPromptTemplate.from_messages(
+                    [
+                        ("system", ROUTER_SYSTEM_PROMPT),
+                        ("user", "{query}"),
+                    ]
+                )
+                structured_llm = router_prompt | llm.with_structured_output(SearchFilters)
+                extracted_filters = structured_llm.invoke({"query": query})
                 
                 # --- 3. THE ENUM FILTER LOGIC ---
                 chroma_filter = {}
@@ -138,7 +115,7 @@ if st.button("Search & Generate") and query:
                         chroma_filter["source"] = mapped_source 
 
                 # Configure initial search kwargs
-                search_kwargs: dict[str, Any] = {"k": 10, "fetch_k": 30} # MMR Needs fetch_k to be higher!
+                search_kwargs: dict[str, Any] = {"k": 10} # MMR Needs fetch_k to be higher!
                 if chroma_filter:
                     search_kwargs["filter"] = chroma_filter 
                     st.success(f"🤖 AI Auto-Filtered by exact source: {chroma_filter}")
