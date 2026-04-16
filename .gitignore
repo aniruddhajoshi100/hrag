@@ -3,3 +3,4 @@ env
 .venv/
 .vscode/
 chroma_db/
+__pycache__/*

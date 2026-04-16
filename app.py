@@ -138,7 +138,7 @@ if st.button("Search & Generate") and query:
                         chroma_filter["source"] = mapped_source 
 
                 # Configure initial search kwargs
-                search_kwargs: dict[str, Any] = {"k": 10} 
+                search_kwargs: dict[str, Any] = {"k": 10, "fetch_k": 30} # MMR Needs fetch_k to be higher!
                 if chroma_filter:
                     search_kwargs["filter"] = chroma_filter 
                     st.success(f"🤖 AI Auto-Filtered by exact source: {chroma_filter}")

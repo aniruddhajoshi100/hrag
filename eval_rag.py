@@ -8,7 +8,7 @@ from langchain_groq import ChatGroq
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
-from app import SearchFilters, PaperKey, PAPER_ALIASES  # Importing from your app.py
+from app import SearchFilters, PaperKey, PAPER_ALIASES
 
 load_dotenv()
 
@@ -20,14 +20,11 @@ if not groq_api_key:
     print("Please set GROQ_API_KEY in .env")
     exit(1)
 
-# Initialize models
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings, collection_name=COLLECTION_NAME)
 
-# We use the versatile model for generating answers
 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.3-70b-versatile")
-# Fast model for routing
-router_llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.1-8b-instant")
+router_llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.3-70b-versatile")
 
 prompt = ChatPromptTemplate.from_template(
     """You are a precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
@@ -42,20 +39,15 @@ prompt = ChatPromptTemplate.from_template(
 )
 document_chain = create_stuff_documents_chain(llm, prompt)
 
-# --- 1. NAIVE RAG (Baseline) ---
 def run_naive_rag(query: str):
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+    start = time.time()
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
     chain = create_retrieval_chain(retriever, document_chain)
-    return chain.invoke({"input": query})
+    ans = chain.invoke({"input": query})
+    return ans, time.time() - start
 
-# --- 2. MMR RAG ---
-def run_mmr_rag(query: str):
-    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5})
-    chain = create_retrieval_chain(retriever, document_chain)
-    return chain.invoke({"input": query})
-
-# --- 3. NOVEL RAG (Hierarchical + Routing) ---
 def run_novel_rag(query: str):
+    start = time.time()
     structured_llm = router_llm.with_structured_output(SearchFilters)
     extracted_filters = structured_llm.invoke(query)
     
@@ -65,22 +57,21 @@ def run_novel_rag(query: str):
         if mapped_source:
             chroma_filter["source"] = mapped_source 
             
-    search_kwargs = {"k": 5}
+    search_kwargs = {"k": 10, "fetch_k": 30}
     if chroma_filter:
         search_kwargs["filter"] = chroma_filter
         
     retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
     test_docs = retriever.invoke(query)
     
-    # Fallback
     if chroma_filter and len(test_docs) == 0:
         search_kwargs.pop("filter", None)
         retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
         
     chain = create_retrieval_chain(retriever, document_chain)
-    return chain.invoke({"input": query})
+    ans = chain.invoke({"input": query})
+    return ans, time.time() - start, chroma_filter
 
-# --- LLM-AS-A-JUDGE EVALUATION ---
 class EvaluationScore(BaseModel):
     score: int = Field(description="Score from 1 to 10 evaluating the accuracy and relevance of the answer.")
     reasoning: str = Field(description="Brief explanation for the score.")
@@ -96,7 +87,6 @@ eval_prompt = ChatPromptTemplate.from_template(
 )
 eval_chain = eval_prompt | llm.with_structured_output(EvaluationScore)
 
-# --- TEST DATASET ---
 test_queries = [
     {
         "question": "In the QLoRA paper, what is the exact memory footprint of a 65B parameter model?",
@@ -105,30 +95,86 @@ test_queries = [
     {
         "question": "What is the core mechanism introduced in the Attention paper?",
         "truth": "Self-attention mechanism computing scaled dot-product attention without recurrence or convolutions."
+    },
+    {
+        "question": "According to the Chain of Thought paper, how does it improve reasoning?",
+        "truth": "It prompts the model to generate intermediate reasoning steps before giving the final answer."
+    },
+    {
+        "question": "Summarize the primary advantage of QLoRA over standard fine-tuning.",
+        "truth": "QLoRA reduces memory usage to enable fine-tuning large models on a single GPU without losing performance."
+    },
+    {
+        "question": "What scaling problem does QLoRA address?",
+        "truth": "It addresses the memory constraints that prevent training large parameter models on standard hardware."
     }
 ]
 
 def evaluate():
     print("Starting Comparison Evaluation...\n")
+    
+    results = []
+    
     for item in test_queries:
         q = item["question"]
         t = item["truth"]
         print(f"--- Query: {q} ---")
-        print(f"Expected: {t}\n")
         
-        for name, func in [("Naive RAG", run_naive_rag), ("MMR RAG", run_mmr_rag), ("Novel Hierarchical RAG", run_novel_rag)]:
-            print(f"Running {name}...")
-            start = time.time()
-            try:
-                res = func(q)
-                ans = res["answer"]
-                ev = eval_chain.invoke({"question": q, "ground_truth": t, "answer": ans})
-                
-                print(f"  Score: {ev.score}/10")
-                print(f"  Time: {time.time() - start:.2f}s")
-                print(f"  Reason: {ev.reasoning}\n")
-            except Exception as e:
-                print(f"  Failed: {e}\n")
+        row = {"Query": q[:35] + "..."}
+        
+        # NAIVE
+        print(f"Running Naive RAG...")
+        res_naive, time_naive = run_naive_rag(q)
+        ans_n = res_naive["answer"]
+        ev_naive = eval_chain.invoke({"question": q, "ground_truth": t, "answer": ans_n})
+        row["Naive_Score"] = ev_naive.score
+        row["Naive_Time"] = time_naive
+        print(f"  Score: {ev_naive.score}/10 | Time: {time_naive:.2f}s")
+        
+        # NOVEL
+        print(f"Running Novel Hierarchical RAG...")
+        res_novel, time_novel, filters = run_novel_rag(q)
+        ans_nov = res_novel["answer"]
+        ev_novel = eval_chain.invoke({"question": q, "ground_truth": t, "answer": ans_nov})
+        row["Novel_Score"] = ev_novel.score
+        row["Novel_Time"] = time_novel
+        row["Filter_Used"] = str(filters.get("source", "None"))
+        print(f"  Filter Extracted: {filters}")
+        print(f"  Score: {ev_novel.score}/10 | Time: {time_novel:.2f}s")
+            
+        results.append(row)
+        print()
+
+    # Create the final tabular result
+    print("\n" + "="*95)
+    print(f"{'FINAL EVALUATION RESULTS':^95}")
+    print("="*95)
+    
+    # Print header
+    header = f"| {'Query Prefix':<38} | {'Naive (Score / Time)':<20} | {'Novel (Score / Time)':<20} | {'Filter Hit':<10} |"
+    print(header)
+    print("-" * len(header))
+    
+    total_naive_s = 0
+    total_novel_s = 0
+    total_naive_t = 0
+    total_novel_t = 0
+    
+    for res in results:
+        n_str = f"{res['Naive_Score']}/10 ({res['Naive_Time']:.1f}s)"
+        nov_str = f"{res['Novel_Score']}/10 ({res['Novel_Time']:.1f}s)"
+        print(f"| {res['Query']:<38} | {n_str:<20} | {nov_str:<20} | {res['Filter_Used'][:10]:<10} |")
+        total_naive_s += res['Naive_Score']
+        total_novel_s += res['Novel_Score']
+        total_naive_t += res['Naive_Time']
+        total_novel_t += res['Novel_Time']
+        
+    print("-" * len(header))
+    
+    avg_n_str = f"{total_naive_s/len(results):.1f}/10 ({total_naive_t/len(results):.1f}s)"
+    avg_nov_str = f"{total_novel_s/len(results):.1f}/10 ({total_novel_t/len(results):.1f}s)"
+    print(f"| {'AVERAGE':<38} | {avg_n_str:<20} | {avg_nov_str:<20} | {'-':<10} |")
+    print("="*95 + "\n")
 
 if __name__ == "__main__":
     evaluate()
