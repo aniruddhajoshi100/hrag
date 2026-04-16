@@ -3,6 +3,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from typing import Any, cast
+from enum import Enum
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr
 from langchain_community.vectorstores import Chroma
@@ -10,8 +11,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-from rag_schema import PaperKey, PAPER_ALIASES, ROUTER_SYSTEM_PROMPT, SearchFilters
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 
 load_dotenv()
 
@@ -23,34 +23,89 @@ if not groq_api_key:
     print("Please set GROQ_API_KEY in .env")
     exit(1)
 
+# --- 1. STRICT MULTIPLE CHOICE & ALIASES (Exact match to app.py) ---
+class PaperKey(str, Enum):
+    qlora = "qlora"
+    attention = "attention"
+    chain_of_thought = "chain_of_thought"
+    unknown = "unknown"
+
+PAPER_ALIASES = {
+    PaperKey.attention: "p1.pdf",
+    PaperKey.qlora: "p2.pdf",
+    PaperKey.chain_of_thought: "p3.pdf"
+}
+
+class SearchFilters(BaseModel):
+    """Schema for extracting metadata filters from a user's natural language query."""
+    target_source: PaperKey = Field(
+        default=PaperKey.unknown, 
+        description="Identify which specific paper is being asked about. Select from the provided enum list. If no specific paper is mentioned, select 'unknown'."
+    )
+    target_section: str | None = Field(
+        default=None, 
+        description="The specific section of the paper mentioned. If no section is mentioned, return None."
+    )
+
+# --- 2. VECTORSTORE & LLM SETUP ---
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings, collection_name=COLLECTION_NAME)
 
 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.3-70b-versatile")
-router_llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.3-70b-versatile")
 
-prompt = ChatPromptTemplate.from_template(
-    """You are a precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
-    If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context."
+# --- 3. NOVEL RAG CHAIN BUILDER (Exact match to app.py) ---
+def build_chain(llm, vectorstore, search_kwargs):
+    prompt = ChatPromptTemplate.from_template(
+        """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
+        Each piece of context includes its hierarchical path (Source File -> Section). 
+        
+        CRITICAL FILE MAPPING:
+        The user will often refer to papers by their common names. Use this exact mapping to associate the Source File paths with the user's question:
+        - "p1.pdf" IS the "Attention Is All You Need" / "Attention" paper.
+        - "p2.pdf" IS the "QLoRA" paper.
+        - "p3.pdf" IS the "Chain of Thought" (CoT) paper.
+        
+        If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
+        
+        Context:
+        {context}
+        
+        Question: {input}
+        
+        Answer:"""
+    )
     
-    Context:
-    {context}
+    document_prompt = PromptTemplate(
+        input_variables=["page_content", "source", "section"],
+        template="[PATH: {source} -> {section}]\n{page_content}\n"
+    )
     
-    Question: {input}
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
     
-    Answer:"""
-)
-document_chain = create_stuff_documents_chain(llm, prompt)
+    document_chain = create_stuff_documents_chain(
+        llm=llm, 
+        prompt=prompt,
+        document_prompt=document_prompt 
+    )
+    
+    return create_retrieval_chain(retriever, document_chain)
 
-router_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", ROUTER_SYSTEM_PROMPT),
-        ("user", "{query}"),
-    ]
-)
-
+# --- 4. EXECUTION FUNCTIONS ---
 def run_naive_rag(query: str):
     start = time.time()
+    # Basic prompt with no path guidance and no file mapping
+    prompt = ChatPromptTemplate.from_template(
+        """You are a precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
+        If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context."
+        
+        Context:
+        {context}
+        
+        Question: {input}
+        
+        Answer:"""
+    )
+    document_chain = create_stuff_documents_chain(llm, prompt)
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
     chain = create_retrieval_chain(retriever, document_chain)
     ans = chain.invoke({"input": query})
@@ -58,31 +113,35 @@ def run_naive_rag(query: str):
 
 def run_novel_rag(query: str):
     start = time.time()
-    structured_llm = router_prompt | router_llm.with_structured_output(SearchFilters)
-    extracted_filters = cast(SearchFilters, structured_llm.invoke({"query": query}))
     
+    # 1. Intelligent Router Step
+    structured_llm = llm.with_structured_output(SearchFilters)
+    extracted_filters = structured_llm.invoke(query)
+    
+    # 2. Enum Filter Logic
     chroma_filter = {}
     if extracted_filters.target_source != PaperKey.unknown:
         mapped_source = PAPER_ALIASES.get(extracted_filters.target_source)
         if mapped_source:
             chroma_filter["source"] = mapped_source 
-            
-    search_kwargs: dict[str, Any] = {"k": 10}
-    if chroma_filter:
-        search_kwargs["filter"] = chroma_filter
 
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
-
+    search_kwargs: dict[str, Any] = {"k": 10} 
     if chroma_filter:
-        test_docs = retriever.invoke(query)
-        if len(test_docs) == 0:
-            chroma_filter = {}
-            retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
+        search_kwargs["filter"] = chroma_filter 
         
-    chain = create_retrieval_chain(retriever, document_chain)
-    ans = chain.invoke({"input": query})
-    return ans, time.time() - start, chroma_filter
+    # 3. The Safety Net
+    test_retriever = vectorstore.as_retriever(search_kwargs={"k": 1, "filter": chroma_filter})
+    if chroma_filter and len(test_retriever.invoke(query)) == 0:
+        search_kwargs.pop("filter", None)
+        chroma_filter = {} # Clear to indicate global search
+        
+    # 4. Chain Creation and Generation
+    chain = build_chain(llm, vectorstore, search_kwargs)
+    response = chain.invoke({"input": query})
+    
+    return response, time.time() - start, chroma_filter
 
+# --- 5. EVALUATION LOGIC ---
 class EvaluationScore(BaseModel):
     score: int = Field(description="Score from 1 to 10 evaluating the accuracy and relevance of the answer.")
     reasoning: str = Field(description="Brief explanation for the score.")
@@ -100,8 +159,8 @@ eval_chain = eval_prompt | llm.with_structured_output(EvaluationScore)
 
 test_queries = [
     {
-        "question": "In the QLoRA paper, what is the exact memory footprint of a 65B parameter model?",
-        "truth": "The 65B parameter model requires a 48GB GPU for finetuning."
+        "question": "In the QLoRA paper, what is the memory footprint of a 65B parameter model?",
+        "truth": "The 65B parameter model requires <48GB GPU memory for finetuning."
     },
     {
         "question": "What is the core mechanism introduced in the Attention paper?",
@@ -121,7 +180,6 @@ test_queries = [
     }
 ]
 
-
 @dataclass
 class EvalResult:
     question: str
@@ -133,12 +191,10 @@ class EvalResult:
     novel_time: float
     filter_used: str
 
-
 def _truncate(text: str, max_len: int = 58) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
-
 
 def _print_answer_block(title: str, answer: str, width: int = 110) -> None:
     print(f"{title}:")
@@ -151,7 +207,6 @@ def _print_answer_block(title: str, answer: str, width: int = 110) -> None:
         wrapped = textwrap.wrap(paragraph, width=width) or [""]
         for line in wrapped:
             print(f"  {line}")
-
 
 def _print_score_table(results: list[EvalResult]) -> None:
     headers = [
