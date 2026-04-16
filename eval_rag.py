@@ -1,9 +1,7 @@
 import os
 import textwrap
 import time
-from dataclasses import dataclass
-from typing import Any, cast
-from enum import Enum
+from typing import Any
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr
 from langchain_community.vectorstores import Chroma
@@ -23,29 +21,27 @@ if not groq_api_key:
     print("Please set GROQ_API_KEY in .env")
     exit(1)
 
-# --- 1. STRICT MULTIPLE CHOICE & ALIASES ---
-class PaperKey(str, Enum):
-    qlora = "qlora"
-    attention = "attention"
-    chain_of_thought = "chain_of_thought"
-    unknown = "unknown"
-
-PAPER_ALIASES = {
-    PaperKey.attention: "p1.pdf",
-    PaperKey.qlora: "p2.pdf",
-    PaperKey.chain_of_thought: "p3.pdf"
-}
-
+# --- 1. DYNAMIC ROUTER SCHEMA ---
 class SearchFilters(BaseModel):
-    target_source: PaperKey = Field(
-        default=PaperKey.unknown, 
-        description="Identify which specific paper is being asked about. Select from the provided enum list. If no specific paper is mentioned, select 'unknown'."
+    """Schema for extracting metadata filters from a user's natural language query."""
+    target_title: str | None = Field(
+        default=None, 
+        description="Identify which specific paper is being asked about. MUST exactly match one of the titles provided in the system prompt. If no specific paper is mentioned, return None."
     )
-    target_section: str | None = Field(default=None)
 
-# --- 2. VECTORSTORE & LLM SETUP ---
+# --- 2. VECTORSTORE & DYNAMIC TITLE EXTRACTION ---
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings, collection_name=COLLECTION_NAME)
+
+# Scan the metadata of all chunks to find unique titles
+try:
+    data = vectorstore.get(include=["metadatas"])
+    unique_titles = list(set(meta.get("title") for meta in data["metadatas"] if meta and "title" in meta))
+except Exception:
+    unique_titles = []
+
+if not unique_titles:
+    print("⚠️ WARNING: No titles found in the database. Did you re-ingest your data with the new chunks.json?")
 
 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.3-70b-versatile")
 
@@ -53,13 +49,7 @@ llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.
 def build_chain(llm, vectorstore, search_kwargs):
     prompt = ChatPromptTemplate.from_template(
         """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
-        Each piece of context includes its hierarchical path (Source File -> Section). 
-        
-        CRITICAL FILE MAPPING:
-        The user will often refer to papers by their common names. Use this exact mapping to associate the Source File paths with the user's question:
-        - "p1.pdf" IS the "Attention Is All You Need" / "Attention" paper.
-        - "p2.pdf" IS the "QLoRA" paper.
-        - "p3.pdf" IS the "Chain of Thought" (CoT) paper.
+        Each piece of context includes its hierarchical path (Title -> Section). Pay close attention to this path to understand where the information comes from.
         
         If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
         
@@ -71,9 +61,10 @@ def build_chain(llm, vectorstore, search_kwargs):
         Answer:"""
     )
     
+    # Updated to use {title} instead of {source}
     document_prompt = PromptTemplate(
-        input_variables=["page_content", "source", "section"],
-        template="[PATH: {source} -> {section}]\n{page_content}\n"
+        input_variables=["page_content", "title", "section"],
+        template="[PATH: {title} -> {section}]\n{page_content}\n"
     )
     
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
@@ -103,14 +94,27 @@ def run_naive_rag(query: str):
 def run_novel_rag(query: str):
     start = time.time()
     
-    structured_llm = llm.with_structured_output(SearchFilters)
-    extracted_filters = structured_llm.invoke(query)
+    # Dynamically inject the exact database titles into the Router's instructions
+    valid_titles_str = "\n".join([f"- {t}" for t in unique_titles])
+    router_system_prompt = f"""You are an intelligent routing agent. Your job is to extract the target paper title from the user's query.
+    You MUST select EXACTLY from this list of valid paper titles (or return None if the query is general):
+    {valid_titles_str}
+    """
+    
+    router_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", router_system_prompt),
+            ("user", "{query}"),
+        ]
+    )
+    
+    structured_llm = router_prompt | llm.with_structured_output(SearchFilters)
+    extracted_filters = structured_llm.invoke({"query": query})
     
     chroma_filter = {}
-    if extracted_filters.target_source != PaperKey.unknown:
-        mapped_source = PAPER_ALIASES.get(extracted_filters.target_source)
-        if mapped_source:
-            chroma_filter["source"] = mapped_source 
+    # Use exact title matching
+    if extracted_filters.target_title and extracted_filters.target_title in unique_titles:
+        chroma_filter["title"] = extracted_filters.target_title 
 
     search_kwargs: dict[str, Any] = {"k": 10} 
     if chroma_filter:
@@ -126,23 +130,7 @@ def run_novel_rag(query: str):
     
     return response, time.time() - start, chroma_filter
 
-# --- 5. EVALUATION LOGIC (Pass/Fail) ---
-class EvaluationScore(BaseModel):
-    success: bool = Field(description="True if the AI successfully extracted the right information and gave a correct answer. False if it output 'Insufficient data', hallucinated, or gave a wrong answer.")
-    reasoning: str = Field(description="Brief explanation for the Pass/Fail judgment.")
-
-eval_prompt = ChatPromptTemplate.from_template(
-    """You are an expert evaluator. Evaluate the AI's answer to the user's question based on the expected ground truth.
-    Did the AI successfully extract the right information? Did it hallucinate? Output True for a Pass, False for a Fail.
-    
-    Question: {question}
-    Expected Truth: {ground_truth}
-    AI Answer: {answer}
-    """
-)
-eval_chain = eval_prompt | llm.with_structured_output(EvaluationScore)
-
-# ADVERSARIAL QUERIES: Designed to confuse Naive RAG by burying the context across multiple papers.
+# --- 5. TEST QUERIES ---
 test_queries = [
     {
         "question": "In the Attention paper, what BLEU score did the model achieve on the English-to-German translation task?",
@@ -163,24 +151,24 @@ test_queries = [
     {
         "question": "In the Chain of Thought paper, what happens to performance on out-of-domain (OOD) test sets compared to standard prompting?",
         "truth": "CoT prompting achieves upward scaling curves, whereas standard prompting performs the worst and fails tasks."
+    },
+    {
+        "question": "In the Attention paper, what is the exact dimensionality of the inner-layer in the position-wise feed-forward networks (d_ff)?",
+        "truth": "The inner-layer has a dimensionality of d_ff = 2048."
+    },
+    {
+        "question": "According to the QLoRA paper, what is the memory footprint of a deployed 7B Guanaco model?",
+        "truth": "It requires just 5 GB of memory."
+    },
+    {
+        "question": "In the Chain of Thought paper, what four specific datasets are used to evaluate Arithmetic Reasoning?",
+        "truth": "GSM8K, SVAMP, ASDiv, and MAWPS."
+    },
+    {
+        "question": "Based on the QLoRA paper, what specific dataset was used to train the Guanaco models, and what does it consist of?",
+        "truth": "The OASST1 dataset, which is a multilingual collection of crowd-sourced multiturn dialogs."
     }
 ]
-
-@dataclass
-class EvalResult:
-    question: str
-    naive_answer: str
-    novel_answer: str
-    naive_pass: bool
-    naive_time: float
-    novel_pass: bool
-    novel_time: float
-    filter_used: str
-
-def _truncate(text: str, max_len: int = 56) -> str:
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3] + "..."
 
 def _print_answer_block(title: str, answer: str, width: int = 110) -> None:
     print(f"{title}:")
@@ -193,88 +181,30 @@ def _print_answer_block(title: str, answer: str, width: int = 110) -> None:
         for line in wrapped:
             print(f"  {line}")
 
-def _print_score_table(results: list[EvalResult]) -> None:
-    headers = ["Query", "Naive Result", "Naive Time(s)", "Novel Result", "Novel Time(s)", "Filter Extracted"]
-
-    rows: list[list[str]] = []
-    for result in results:
-        rows.append([
-            _truncate(result.question),
-            "PASS" if result.naive_pass else "FAIL",
-            f"{result.naive_time:.2f}",
-            "PASS" if result.novel_pass else "FAIL",
-            f"{result.novel_time:.2f}",
-            result.filter_used,
-        ])
-
-    naive_pass_rate = (sum(1 for r in results if r.naive_pass) / len(results)) * 100
-    novel_pass_rate = (sum(1 for r in results if r.novel_pass) / len(results)) * 100
-    avg_naive_time = sum(r.naive_time for r in results) / len(results)
-    avg_novel_time = sum(r.novel_time for r in results) / len(results)
-
-    avg_row = [
-        "PASS RATE",
-        f"{naive_pass_rate:.0f}%",
-        f"{avg_naive_time:.2f}",
-        f"{novel_pass_rate:.0f}%",
-        f"{avg_novel_time:.2f}",
-        "-",
-    ]
-
-    widths = [max(len(headers[i]), max((len(row[i]) for row in rows), default=0), len(avg_row[i])) for i in range(len(headers))]
-
-    def make_separator(fill: str = "-") -> str:
-        return "+" + "+".join(fill * (w + 2) for w in widths) + "+"
-
-    def make_row(values: list[str]) -> str:
-        padded = [f" {values[i]:<{widths[i]}} " for i in range(len(values))]
-        return "|" + "|".join(padded) + "|"
-
-    print("\nFINAL EVALUATION SCORES (PASS/FAIL)")
-    print(make_separator("="))
-    print(make_row(headers))
-    print(make_separator("-"))
-    for row in rows:
-        print(make_row(row))
-    print(make_separator("-"))
-    print(make_row(avg_row))
-    print(make_separator("="))
-
 def evaluate():
     print("Starting Comparison Evaluation...\n")
-    results: list[EvalResult] = []
+    print("=" * 80)
     
-    for item in test_queries:
+    for i, item in enumerate(test_queries):
         q = item["question"]
         t = item["truth"]
-        print(f"--- Query: {q} ---")
+        print(f"Test {i+1}/{len(test_queries)}")
+        print(f"Query: {q}")
+        print(f"Expected Truth: {t}\n")
         
         # NAIVE
-        print(f"Running Naive RAG...")
         res_naive, time_naive = run_naive_rag(q)
         ans_n = res_naive["answer"]
-        ev_naive = cast(EvaluationScore, eval_chain.invoke({"question": q, "ground_truth": t, "answer": ans_n}))
         _print_answer_block("Naive Answer", ans_n)
-        print(f"  Result: {'PASS' if ev_naive.success else 'FAIL'} | Time: {time_naive:.2f}s\n")
+        print(f"  Time: {time_naive:.2f}s\n")
         
         # NOVEL
-        print(f"Running Novel Hierarchical RAG...")
         res_novel, time_novel, filters = run_novel_rag(q)
         ans_nov = res_novel["answer"]
-        ev_novel = cast(EvaluationScore, eval_chain.invoke({"question": q, "ground_truth": t, "answer": ans_nov}))
         _print_answer_block("Novel Answer", ans_nov)
-        print(f"  Result: {'GOOD' if ev_novel.success else 'POOR'} | Time: {time_novel:.2f}s")
-        print(f"  Filter Extracted: {filters}\n")
-
-        results.append(
-            EvalResult(
-                question=q, naive_answer=ans_n, novel_answer=ans_nov,
-                naive_pass=ev_naive.success, naive_time=time_naive,
-                novel_pass=ev_novel.success, novel_time=time_novel,
-                filter_used=str(filters.get("source", "None")),
-            )
-        )
-    _print_score_table(results)
+        print(f"  Filter Extracted: {filters}")
+        print(f"  Time: {time_novel:.2f}s\n")
+        print("=" * 80)
 
 if __name__ == "__main__":
     evaluate()
