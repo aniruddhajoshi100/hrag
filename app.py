@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from enum import Enum
 from dotenv import load_dotenv
 import streamlit as st
 from pydantic import BaseModel, Field, SecretStr
@@ -8,7 +9,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 
 load_dotenv()
 
@@ -19,16 +20,33 @@ COLLECTION_NAME = "academic_papers"
 
 env_api_key = os.getenv("GROQ_API_KEY", "")
 
-# --- 1. Define the AI Router Schema ---
+# --- 1. STRICT MULTIPLE CHOICE (The Enum) ---
+# We force the LLM to pick one of these exact keys. It cannot invent new strings.
+class PaperKey(str, Enum):
+    qlora = "qlora"
+    attention = "attention"
+    chain_of_thought = "chain_of_thought"
+    unknown = "unknown"
+
+# --- 2. THE ALIAS MAPPER ---
+# Now it maps the strict Enum keys directly to your exact filenames
+PAPER_ALIASES = {
+    PaperKey.attention: "p1.pdf",
+    PaperKey.qlora: "p2.pdf",
+    PaperKey.chain_of_thought: "p3.pdf"
+}
+
+# --- 3. THE STRICT AI SCHEMA ---
 class SearchFilters(BaseModel):
     """Schema for extracting metadata filters from a user's natural language query."""
-    target_source: str | None = Field(
-        default=None, 
-        description="The specific paper, filename, or author mentioned (e.g., 'p1.pdf', 'Attention paper'). If no specific paper is mentioned, return None."
+    target_source: PaperKey = Field(
+        default=PaperKey.unknown, 
+        description="Identify which specific paper is being asked about. Select from the provided enum list. If no specific paper is mentioned, select 'unknown'."
     )
+    # We keep target_section so the AI extracts it, but we won't force ChromaDB to hard-filter by it.
     target_section: str | None = Field(
         default=None, 
-        description="The specific section of the paper mentioned (e.g., 'Methodology', 'Abstract', 'Results', 'Conclusion'). If no section is mentioned, return None."
+        description="The specific section of the paper mentioned. If no section is mentioned, return None."
     )
 
 # --- Sidebar Configuration ---
@@ -41,12 +59,9 @@ else:
 
 model_name = st.sidebar.selectbox("LLM Model", ["llama-3.1-8b-instant", "llama-3.1-70b-versatile", "mixtral-8x7b-32768"])
 
-# Notice: We completely removed the manual Target Section/Source text inputs from the sidebar!
-
 # --- Core RAG Setup Functions ---
 @st.cache_resource
 def load_vectorstore():
-    # Use the same free local embedding model
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     if not os.path.exists(CHROMA_DB_DIR):
         return None
@@ -54,10 +69,11 @@ def load_vectorstore():
     return db
 
 def build_chain(llm, vectorstore, search_kwargs):
-    # Combine user query explicitly to the LLM alongside retrieved context
     prompt = ChatPromptTemplate.from_template(
         """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
-        If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate external knowledge.
+        Each piece of context includes its hierarchical path (Source File -> Section). Pay close attention to this path to understand where the information comes from.
+        
+        If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
         
         Context:
         {context}
@@ -67,9 +83,19 @@ def build_chain(llm, vectorstore, search_kwargs):
         Answer:"""
     )
     
-    # Using MMR to diversify results
-    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
-    document_chain = create_stuff_documents_chain(llm, prompt)
+    document_prompt = PromptTemplate(
+        input_variables=["page_content", "source", "section"],
+        template="[PATH: {source} -> {section}]\n{page_content}\n"
+    )
+    
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
+    
+    document_chain = create_stuff_documents_chain(
+        llm=llm, 
+        prompt=prompt,
+        document_prompt=document_prompt 
+    )
+    
     retrieval_chain = create_retrieval_chain(retriever, document_chain)
     return retrieval_chain
 
@@ -96,40 +122,49 @@ if st.button("Search & Generate") and query:
                 # 1. Initialize Groq Client
                 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model=model_name)
                 
-                # --- NEW: The Intelligent Router Step ---
-                # Force the LLM to output a JSON object matching our SearchFilters schema
+                # 2. The Intelligent Router Step
                 structured_llm = llm.with_structured_output(SearchFilters)
                 extracted_filters = structured_llm.invoke(query)
                 
-                # Build the Chroma dictionary dynamically based on what the AI found
+                # --- 3. THE ENUM FILTER LOGIC ---
                 chroma_filter = {}
-                if extracted_filters.target_source:
-                    chroma_filter["source"] = {"$contains": extracted_filters.target_source}
-                if extracted_filters.target_section:
-                    chroma_filter["section"] = {"$contains": extracted_filters.target_section}
-                
-                # Display to the user what the AI decided to filter by
-                if chroma_filter:
-                    st.success(f"AI Auto-Filtered by: {chroma_filter}")
-                else:
-                    st.info("AI detected no specific filters. Executing global search.")
-                # ----------------------------------------
-                
-                # 2. Configure kwargs for LangChain's Chroma Retriever
-                search_kwargs: dict[str, Any] = {"k": 4} 
+
+                # If the AI successfully picked a known paper...
+                if extracted_filters.target_source != PaperKey.unknown:
+                    # Get the exact filename from our alias dictionary
+                    mapped_source = PAPER_ALIASES.get(extracted_filters.target_source)
+                    
+                    if mapped_source:
+                        chroma_filter["source"] = mapped_source 
+
+                # Configure initial search kwargs
+                search_kwargs: dict[str, Any] = {"k": 10} 
                 if chroma_filter:
                     search_kwargs["filter"] = chroma_filter 
+                    st.success(f"🤖 AI Auto-Filtered by exact source: {chroma_filter}")
+                else:
+                    st.info("🤖 Executing global vector search.")
+                    
+                # --- THE SAFETY NET ---
+                test_retriever = vectorstore.as_retriever(search_kwargs={"k": 1, "filter": chroma_filter})
+                if chroma_filter and len(test_retriever.invoke(query)) == 0:
+                    st.warning(f"⚠️ Could not find exact match for {chroma_filter} in database. Falling back to global search...")
+                    search_kwargs.pop("filter", None)
+                # ----------------------------------------
                 
-                # 3. Create the Chain and generate
+                st.spinner("Executing search and generating answer...")
+                
+                # 4. Create the Chain and generate
                 chain = build_chain(llm, vectorstore, search_kwargs)
                 response = chain.invoke({"input": query})
                 
-                # 4. Display Results
+                # 5. Display Results
                 st.markdown("### Answer")
                 st.write(response["answer"])
                 
                 st.markdown("### Source Evidence Retrieved")
                 for i, doc in enumerate(response["context"]):
+                    # Reverted to generic 'Unknown File' to avoid system identifiers
                     with st.expander(f"Source {i+1}: {doc.metadata.get('source', 'Unknown File')} | Section: {doc.metadata.get('section', 'Main Text')}"):
                         st.json(doc.metadata)  
                         st.write(doc.page_content) 
