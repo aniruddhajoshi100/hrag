@@ -13,6 +13,7 @@ from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.runnables import RunnableLambda
 
 load_dotenv()
 
@@ -36,7 +37,6 @@ class SearchFilters(BaseModel):
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings, collection_name=COLLECTION_NAME)
 
-# Scan the metadata of all chunks to find unique titles
 try:
     data = vectorstore.get(include=["metadatas", "documents"])
     unique_titles = list(set(meta.get("title") for meta in data["metadatas"] if meta and "title" in meta))
@@ -88,14 +88,13 @@ def ensure_hierarchy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     normalized["section"] = normalized["path_level_2"]
 
     hierarchy_parts = [normalized["path_level_1"], normalized["path_level_2"]]
-    if level_3 and str(level_3).strip():
+    if level_3 and str(level_3).strip() and str(level_3).strip().lower() != "general":
         normalized["path_level_3"] = str(level_3)
         normalized["subsection"] = str(level_3)
         hierarchy_parts.append(normalized["path_level_3"])
     else:
         normalized.pop("path_level_3", None)
-        if "subsection" in normalized and not str(normalized.get("subsection", "")).strip():
-            normalized.pop("subsection", None)
+        normalized.pop("subsection", None)
 
     normalized["hierarchy_path"] = " -> ".join(hierarchy_parts)
     normalized["path_depth"] = len(hierarchy_parts)
@@ -131,13 +130,23 @@ def build_hybrid_retriever(vectorstore, corpus_docs: list[Document], search_kwar
 
     return EnsembleRetriever(retrievers=[vector_retriever, bm25_retriever], weights=[0.7, 0.3])
 
+
+def clean_retrieved_docs(docs: list[Document]) -> list[Document]:
+    for doc in docs:
+        doc.metadata = ensure_hierarchy_metadata(doc.metadata)
+    return docs
+
+
 # --- 3. NOVEL RAG CHAIN BUILDER ---
 def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
     prompt = ChatPromptTemplate.from_template(
-        """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
-        Each piece of context includes its hierarchical path (Title -> Section -> Subsection, when available). Pay close attention to this path to understand where the information comes from.
+        """You are a highly precise academic research assistant. Use ONLY the following context to answer the user's query. 
+        Each piece of context includes a hierarchical path formatted as [PATH: Title -> Section].
         
-        If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
+        CRITICAL RULES:
+        1. You MUST begin your answer by explicitly writing "Retrieved Path: " followed by the exact path(s) of the context you are using.
+        2. Do not be overly pedantic. If a user asks for an "exact" number but the text provides bounds (e.g., <48GB) or a table of values, provide that data instead of refusing.
+        3. If the context does not contain the answer, you MUST still output "Retrieved Path: " with the top path, and then explain exactly why the text there does not answer the question. Do not simply say "Insufficient data."
         
         Context:
         {context}
@@ -147,19 +156,27 @@ def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
         Answer:"""
     )
     
-    # Updated to use {title} instead of {source}
     document_prompt = PromptTemplate(
         input_variables=["page_content", "hierarchy_path"],
         template="[PATH: {hierarchy_path}]\n{page_content}\n"
     )
 
     retriever = build_hybrid_retriever(vectorstore, corpus_docs, search_kwargs)
+    
+    cleaned_retriever = (
+        RunnableLambda(lambda x: x["input"]) 
+        | retriever 
+        | RunnableLambda(clean_retrieved_docs)
+    )
+    
     document_chain = create_stuff_documents_chain(llm=llm, prompt=prompt, document_prompt=document_prompt)
-    return create_retrieval_chain(retriever, document_chain)
+    return create_retrieval_chain(cleaned_retriever, document_chain)
 
 # --- 4. EXECUTION FUNCTIONS ---
 def run_naive_rag(query: str):
     start = time.time()
+    
+    # 1. Truly Naive Prompt (No Path instructions)
     prompt = ChatPromptTemplate.from_template(
         """You are a precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
         If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context."
@@ -171,16 +188,26 @@ def run_naive_rag(query: str):
         
         Answer:"""
     )
-    document_chain = create_stuff_documents_chain(llm, prompt)
+    
+    # 2. Truly Naive Formatting (Raw text only, completely ignoring metadata)
+    naive_document_prompt = PromptTemplate(
+        input_variables=["page_content"],
+        template="{page_content}\n"
+    )
+    
+    # 3. Standard Dense Vector Search (No Hybrid/BM25)
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
-    chain = create_retrieval_chain(retriever, document_chain)
+    safe_retriever = RunnableLambda(lambda x: x["input"]) | retriever
+    
+    document_chain = create_stuff_documents_chain(llm, prompt, document_prompt=naive_document_prompt)
+    chain = create_retrieval_chain(safe_retriever, document_chain)
     ans = chain.invoke({"input": query})
     return ans, time.time() - start
+
 
 def run_novel_rag(query: str):
     start = time.time()
     
-    # Dynamically inject the exact database titles into the Router's instructions
     valid_titles_str = "\n".join([f"- {t}" for t in unique_titles])
     router_system_prompt = f"""You are an intelligent routing agent. Your job is to extract the target paper title from the user's query.
     You MUST select EXACTLY from this list of valid paper titles (or return None if the query is general):
@@ -198,7 +225,6 @@ def run_novel_rag(query: str):
     extracted_filters = structured_llm.invoke({"query": query})
     
     chroma_filter = {}
-    # Use exact title matching
     if extracted_filters.target_title and extracted_filters.target_title in unique_titles:
         chroma_filter["title"] = extracted_filters.target_title 
 
@@ -268,27 +294,6 @@ def _print_answer_block(title: str, answer: str, width: int = 110) -> None:
             print(f"  {line}")
 
 
-def _print_retrieved_paths(title: str, response_payload: dict[str, Any]) -> None:
-    print(f"{title}:")
-    docs = response_payload.get("context", []) if isinstance(response_payload, dict) else []
-    if not docs:
-        print("  [no retrieved context]")
-        return
-
-    for idx, doc in enumerate(docs, start=1):
-        metadata = doc.metadata if hasattr(doc, "metadata") else {}
-        path_value = metadata.get("hierarchy_path")
-        if not path_value:
-            title_value = metadata.get("title") or metadata.get("path_level_1") or "Unknown Title"
-            section_value = metadata.get("section") or metadata.get("path_level_2") or "Main Text"
-            subsection_value = metadata.get("path_level_3") or metadata.get("subsection")
-            path_parts = [str(title_value), str(section_value)]
-            if subsection_value:
-                path_parts.append(str(subsection_value))
-            path_value = " -> ".join(path_parts)
-
-        print(f"  {idx}. {path_value}")
-
 def evaluate():
     print("Starting Comparison Evaluation...\n")
     print("=" * 80)
@@ -304,14 +309,12 @@ def evaluate():
         res_naive, time_naive = run_naive_rag(q)
         ans_n = res_naive["answer"]
         _print_answer_block("Naive Answer", ans_n)
-        _print_retrieved_paths("Naive Retrieved Paths", res_naive)
         print(f"  Time: {time_naive:.2f}s\n")
         
         # NOVEL
         res_novel, time_novel, filters = run_novel_rag(q)
         ans_nov = res_novel["answer"]
         _print_answer_block("Novel Answer", ans_nov)
-        _print_retrieved_paths("Novel Retrieved Paths", res_novel)
         print(f"  Filter Extracted: {filters}")
         print(f"  Time: {time_novel:.2f}s\n")
         print("=" * 80)
