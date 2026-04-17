@@ -67,14 +67,51 @@ def load_vectorstore_and_titles():
     return db, unique_titles, corpus_docs
 
 
+def _infer_subsection_from_section(section_value: str) -> tuple[str, str | None]:
+    text = str(section_value or "").strip()
+    if ":" not in text:
+        return text, None
+
+    prefix, suffix = text.split(":", 1)
+    prefix = prefix.strip()
+    suffix = suffix.strip()
+    if not prefix or not suffix:
+        return text, None
+
+    # Heuristic: shorter prefixes are likely section headers with a subsection-like detail after ':'.
+    if len(prefix.split()) <= 8:
+        return prefix, suffix
+
+    return text, None
+
+
 def ensure_hierarchy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(metadata)
     level_1 = normalized.get("path_level_1") or normalized.get("title") or normalized.get("source") or "Unknown Document"
     level_2 = normalized.get("path_level_2") or normalized.get("section") or "Main Text"
+    level_3 = normalized.get("path_level_3") or normalized.get("subsection")
+
+    inferred_section, inferred_subsection = _infer_subsection_from_section(level_2)
+    level_2 = inferred_section or "Main Text"
+    if not level_3:
+        level_3 = inferred_subsection
+
     normalized["path_level_1"] = str(level_1)
     normalized["path_level_2"] = str(level_2)
-    normalized["hierarchy_path"] = normalized.get("hierarchy_path") or f"{normalized['path_level_1']} -> {normalized['path_level_2']}"
-    normalized["path_depth"] = 2
+    normalized["section"] = normalized["path_level_2"]
+
+    hierarchy_parts = [normalized["path_level_1"], normalized["path_level_2"]]
+    if level_3 and str(level_3).strip():
+        normalized["path_level_3"] = str(level_3)
+        normalized["subsection"] = str(level_3)
+        hierarchy_parts.append(normalized["path_level_3"])
+    else:
+        normalized.pop("path_level_3", None)
+        if "subsection" in normalized and not str(normalized.get("subsection", "")).strip():
+            normalized.pop("subsection", None)
+
+    normalized["hierarchy_path"] = " -> ".join(hierarchy_parts)
+    normalized["path_depth"] = len(hierarchy_parts)
     return normalized
 
 
@@ -107,7 +144,7 @@ def build_hybrid_retriever(vectorstore, corpus_docs: list[Document], search_kwar
 def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
     prompt = ChatPromptTemplate.from_template(
         """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
-        Each piece of context includes its hierarchical path (Title -> Section). Pay close attention to this path to understand where the information comes from.
+        Each piece of context includes its hierarchical path (Title -> Section -> Subsection, when available). Pay close attention to this path to understand where the information comes from.
         
         If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
         
@@ -211,8 +248,13 @@ if st.button("Search & Generate") and query:
                 
                 st.markdown("### Source Evidence Retrieved")
                 for i, doc in enumerate(response["context"]):
+                    subsection_value = doc.metadata.get("path_level_3") or doc.metadata.get("subsection")
+                    section_display = doc.metadata.get("section", "Main Text")
+                    if subsection_value:
+                        section_display = f"{section_display} -> {subsection_value}"
+
                     # Show the actual title instead of 'p1.pdf' in the UI expander
-                    with st.expander(f"Source {i+1}: {doc.metadata.get('title', 'Unknown Title')} | Section: {doc.metadata.get('section', 'Main Text')}"):
+                    with st.expander(f"Source {i+1}: {doc.metadata.get('title', 'Unknown Title')} | Section: {section_display}"):
                         st.json(doc.metadata)  
                         st.write(doc.page_content) 
                         
