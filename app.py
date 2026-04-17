@@ -4,10 +4,13 @@ from dotenv import load_dotenv
 import streamlit as st
 from pydantic import BaseModel, Field, SecretStr
 from langchain_community.vectorstores import Chroma
+from langchain_community.retrievers import BM25Retriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 
 load_dotenv()
@@ -43,19 +46,65 @@ def load_vectorstore_and_titles():
     """Loads the vectorstore and dynamically extracts all unique paper titles from the database."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     if not os.path.exists(CHROMA_DB_DIR):
-        return None, []
+        return None, [], []
     db = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings, collection_name=COLLECTION_NAME)
-    
+    corpus_docs: list[Document] = []
+
     # Scan the metadata of all chunks to find unique titles
     try:
-        data = db.get(include=["metadatas"])
+        data = db.get(include=["metadatas", "documents"])
         unique_titles = list(set(meta.get("title") for meta in data["metadatas"] if meta and "title" in meta))
+
+        for raw_content, raw_meta in zip(data.get("documents", []), data.get("metadatas", [])):
+            if not raw_content or not str(raw_content).strip():
+                continue
+            metadata = ensure_hierarchy_metadata(raw_meta or {})
+            corpus_docs.append(Document(page_content=str(raw_content), metadata=metadata))
     except Exception:
         unique_titles = []
-        
-    return db, unique_titles
+        corpus_docs = []
 
-def build_chain(llm, vectorstore, search_kwargs):
+    return db, unique_titles, corpus_docs
+
+
+def ensure_hierarchy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(metadata)
+    level_1 = normalized.get("path_level_1") or normalized.get("title") or normalized.get("source") or "Unknown Document"
+    level_2 = normalized.get("path_level_2") or normalized.get("section") or "Main Text"
+    normalized["path_level_1"] = str(level_1)
+    normalized["path_level_2"] = str(level_2)
+    normalized["hierarchy_path"] = normalized.get("hierarchy_path") or f"{normalized['path_level_1']} -> {normalized['path_level_2']}"
+    normalized["path_depth"] = 2
+    return normalized
+
+
+def _matches_filter(metadata: dict[str, Any], chroma_filter: dict[str, Any]) -> bool:
+    if not chroma_filter:
+        return True
+
+    for key, expected in chroma_filter.items():
+        if isinstance(expected, dict) and "$eq" in expected:
+            expected = expected["$eq"]
+        if metadata.get(key) != expected:
+            return False
+    return True
+
+
+def build_hybrid_retriever(vectorstore, corpus_docs: list[Document], search_kwargs: dict[str, Any]):
+    vector_retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
+    if not corpus_docs:
+        return vector_retriever
+
+    bm25_candidates = [doc for doc in corpus_docs if _matches_filter(doc.metadata, search_kwargs.get("filter", {}))]
+    if not bm25_candidates:
+        bm25_candidates = corpus_docs
+
+    bm25_retriever = BM25Retriever.from_documents(bm25_candidates)
+    bm25_retriever.k = int(search_kwargs.get("k", 10))
+
+    return EnsembleRetriever(retrievers=[vector_retriever, bm25_retriever], weights=[0.7, 0.3])
+
+def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
     prompt = ChatPromptTemplate.from_template(
         """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
         Each piece of context includes its hierarchical path (Title -> Section). Pay close attention to this path to understand where the information comes from.
@@ -72,11 +121,11 @@ def build_chain(llm, vectorstore, search_kwargs):
     
     # Notice we updated the input variables to use your new 'title' metadata field!
     document_prompt = PromptTemplate(
-        input_variables=["page_content", "title", "section"],
-        template="[PATH: {title} -> {section}]\n{page_content}\n"
+        input_variables=["page_content", "hierarchy_path"],
+        template="[PATH: {hierarchy_path}]\n{page_content}\n"
     )
-    
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
+
+    retriever = build_hybrid_retriever(vectorstore, corpus_docs, search_kwargs)
     
     document_chain = create_stuff_documents_chain(
         llm=llm, 
@@ -92,7 +141,7 @@ st.title("Hierarchical RAG for Academic Documents")
 st.markdown("Search across papers. The AI will automatically route using metadata titles instead of generic filenames.")
 
 # Fetch both the database AND the list of valid titles
-vectorstore, unique_titles = load_vectorstore_and_titles()
+vectorstore, unique_titles, corpus_docs = load_vectorstore_and_titles()
 
 if not vectorstore:
     st.warning("No Vector Database found. Please make sure you have run the ingestion script first to generate `./chroma_db`.")
@@ -142,7 +191,7 @@ if st.button("Search & Generate") and query:
                     search_kwargs["filter"] = chroma_filter 
                     st.success(f"🤖 AI Auto-Filtered by exact title: {chroma_filter}")
                 else:
-                    st.info("🤖 Executing global vector search.")
+                    st.info("🤖 Executing global hybrid retrieval (vector + lexical).")
                     
                 # --- THE SAFETY NET ---
                 test_retriever = vectorstore.as_retriever(search_kwargs={"k": 1, "filter": chroma_filter})
@@ -151,11 +200,10 @@ if st.button("Search & Generate") and query:
                     search_kwargs.pop("filter", None)
                 # ----------------------------------------
                 
-                st.spinner("Executing search and generating answer...")
-                
                 # 4. Create the Chain and generate
-                chain = build_chain(llm, vectorstore, search_kwargs)
-                response = chain.invoke({"input": query})
+                with st.spinner("Executing hybrid retrieval and generating answer..."):
+                    chain = build_chain(llm, vectorstore, corpus_docs, search_kwargs)
+                    response = chain.invoke({"input": query})
                 
                 # 5. Display Results
                 st.markdown("### Answer")

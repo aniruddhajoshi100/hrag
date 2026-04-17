@@ -4,11 +4,14 @@ import time
 from typing import Any
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr
+from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
+from langchain_community.retrievers import BM25Retriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 
 load_dotenv()
@@ -35,18 +38,65 @@ vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddi
 
 # Scan the metadata of all chunks to find unique titles
 try:
-    data = vectorstore.get(include=["metadatas"])
+    data = vectorstore.get(include=["metadatas", "documents"])
     unique_titles = list(set(meta.get("title") for meta in data["metadatas"] if meta and "title" in meta))
+    corpus_docs: list[Document] = []
+    for raw_content, raw_meta in zip(data.get("documents", []), data.get("metadatas", [])):
+        if not raw_content or not str(raw_content).strip():
+            continue
+        corpus_docs.append(Document(page_content=str(raw_content), metadata=raw_meta or {}))
 except Exception:
     unique_titles = []
+    corpus_docs = []
 
 if not unique_titles:
     print("⚠️ WARNING: No titles found in the database. Did you re-ingest your data with the new chunks.json?")
 
 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model="llama-3.3-70b-versatile")
 
+
+def ensure_hierarchy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(metadata)
+    level_1 = normalized.get("path_level_1") or normalized.get("title") or normalized.get("source") or "Unknown Document"
+    level_2 = normalized.get("path_level_2") or normalized.get("section") or "Main Text"
+    normalized["path_level_1"] = str(level_1)
+    normalized["path_level_2"] = str(level_2)
+    normalized["hierarchy_path"] = normalized.get("hierarchy_path") or f"{normalized['path_level_1']} -> {normalized['path_level_2']}"
+    normalized["path_depth"] = 2
+    return normalized
+
+
+for doc in corpus_docs:
+    doc.metadata = ensure_hierarchy_metadata(doc.metadata)
+
+
+def _matches_filter(metadata: dict[str, Any], chroma_filter: dict[str, Any]) -> bool:
+    if not chroma_filter:
+        return True
+    for key, expected in chroma_filter.items():
+        if isinstance(expected, dict) and "$eq" in expected:
+            expected = expected["$eq"]
+        if metadata.get(key) != expected:
+            return False
+    return True
+
+
+def build_hybrid_retriever(vectorstore, corpus_docs: list[Document], search_kwargs: dict[str, Any]):
+    vector_retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
+    if not corpus_docs:
+        return vector_retriever
+
+    bm25_candidates = [doc for doc in corpus_docs if _matches_filter(doc.metadata, search_kwargs.get("filter", {}))]
+    if not bm25_candidates:
+        bm25_candidates = corpus_docs
+
+    bm25_retriever = BM25Retriever.from_documents(bm25_candidates)
+    bm25_retriever.k = int(search_kwargs.get("k", 10))
+
+    return EnsembleRetriever(retrievers=[vector_retriever, bm25_retriever], weights=[0.7, 0.3])
+
 # --- 3. NOVEL RAG CHAIN BUILDER ---
-def build_chain(llm, vectorstore, search_kwargs):
+def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
     prompt = ChatPromptTemplate.from_template(
         """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
         Each piece of context includes its hierarchical path (Title -> Section). Pay close attention to this path to understand where the information comes from.
@@ -63,11 +113,11 @@ def build_chain(llm, vectorstore, search_kwargs):
     
     # Updated to use {title} instead of {source}
     document_prompt = PromptTemplate(
-        input_variables=["page_content", "title", "section"],
-        template="[PATH: {title} -> {section}]\n{page_content}\n"
+        input_variables=["page_content", "hierarchy_path"],
+        template="[PATH: {hierarchy_path}]\n{page_content}\n"
     )
-    
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
+
+    retriever = build_hybrid_retriever(vectorstore, corpus_docs, search_kwargs)
     document_chain = create_stuff_documents_chain(llm=llm, prompt=prompt, document_prompt=document_prompt)
     return create_retrieval_chain(retriever, document_chain)
 
@@ -125,7 +175,7 @@ def run_novel_rag(query: str):
         search_kwargs.pop("filter", None)
         chroma_filter = {} 
         
-    chain = build_chain(llm, vectorstore, search_kwargs)
+    chain = build_chain(llm, vectorstore, corpus_docs, search_kwargs)
     response = chain.invoke({"input": query})
     
     return response, time.time() - start, chroma_filter
