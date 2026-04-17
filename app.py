@@ -12,6 +12,7 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.runnables import RunnableLambda
 
 load_dotenv()
 
@@ -24,7 +25,6 @@ env_api_key = os.getenv("GROQ_API_KEY", "")
 
 # --- 1. DYNAMIC ROUTER SCHEMA ---
 class SearchFilters(BaseModel):
-    """Schema for extracting metadata filters from a user's natural language query."""
     target_title: str | None = Field(
         default=None, 
         description="Identify which specific paper is being asked about. MUST exactly match one of the titles provided in the system prompt. If no specific paper is mentioned, return None."
@@ -43,14 +43,12 @@ model_name = st.sidebar.selectbox("LLM Model", ["llama-3.1-8b-instant", "llama-3
 # --- Core RAG Setup Functions ---
 @st.cache_resource
 def load_vectorstore_and_titles():
-    """Loads the vectorstore and dynamically extracts all unique paper titles from the database."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     if not os.path.exists(CHROMA_DB_DIR):
         return None, [], []
     db = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings, collection_name=COLLECTION_NAME)
     corpus_docs: list[Document] = []
 
-    # Scan the metadata of all chunks to find unique titles
     try:
         data = db.get(include=["metadatas", "documents"])
         unique_titles = list(set(meta.get("title") for meta in data["metadatas"] if meta and "title" in meta))
@@ -78,7 +76,6 @@ def _infer_subsection_from_section(section_value: str) -> tuple[str, str | None]
     if not prefix or not suffix:
         return text, None
 
-    # Heuristic: shorter prefixes are likely section headers with a subsection-like detail after ':'.
     if len(prefix.split()) <= 8:
         return prefix, suffix
 
@@ -101,14 +98,14 @@ def ensure_hierarchy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     normalized["section"] = normalized["path_level_2"]
 
     hierarchy_parts = [normalized["path_level_1"], normalized["path_level_2"]]
-    if level_3 and str(level_3).strip():
+    
+    if level_3 and str(level_3).strip() and str(level_3).strip().lower() != "general":
         normalized["path_level_3"] = str(level_3)
         normalized["subsection"] = str(level_3)
         hierarchy_parts.append(normalized["path_level_3"])
     else:
         normalized.pop("path_level_3", None)
-        if "subsection" in normalized and not str(normalized.get("subsection", "")).strip():
-            normalized.pop("subsection", None)
+        normalized.pop("subsection", None)
 
     normalized["hierarchy_path"] = " -> ".join(hierarchy_parts)
     normalized["path_depth"] = len(hierarchy_parts)
@@ -141,12 +138,23 @@ def build_hybrid_retriever(vectorstore, corpus_docs: list[Document], search_kwar
 
     return EnsembleRetriever(retrievers=[vector_retriever, bm25_retriever], weights=[0.7, 0.3])
 
+
+def clean_retrieved_docs(docs: list[Document]) -> list[Document]:
+    for doc in docs:
+        doc.metadata = ensure_hierarchy_metadata(doc.metadata)
+    return docs
+
+
 def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
+    # --- THE FIX: FORCING THE LLM TO SHOW ITS WORK ---
     prompt = ChatPromptTemplate.from_template(
-        """You are a highly precise academic research assistant. Use ONLY the following context from academic papers to answer the query. 
-        Each piece of context includes its hierarchical path (Title -> Section -> Subsection, when available). Pay close attention to this path to understand where the information comes from.
+        """You are a highly precise academic research assistant. Use ONLY the following context to answer the user's query. 
+        Each piece of context includes a hierarchical path formatted as [PATH: Title -> Section].
         
-        If you cannot find the answer in the context, strictly output "Insufficient data to answer this query based on the retrieved context." Do not hallucinate.
+        CRITICAL RULES:
+        1. You MUST begin your answer by explicitly writing "Retrieved Path: " followed by the exact path(s) of the context you are using.
+        2. Do not be overly pedantic. If a user asks for an "exact" number but the text provides bounds (e.g., <48GB) or a table of values, provide that data instead of refusing.
+        3. If the context does not contain the answer, you MUST still output "Retrieved Path: " with the top path, and then explain exactly why the text there does not answer the question. Do not simply say "Insufficient data."
         
         Context:
         {context}
@@ -156,7 +164,6 @@ def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
         Answer:"""
     )
     
-    # Notice we updated the input variables to use your new 'title' metadata field!
     document_prompt = PromptTemplate(
         input_variables=["page_content", "hierarchy_path"],
         template="[PATH: {hierarchy_path}]\n{page_content}\n"
@@ -164,20 +171,26 @@ def build_chain(llm, vectorstore, corpus_docs, search_kwargs):
 
     retriever = build_hybrid_retriever(vectorstore, corpus_docs, search_kwargs)
     
+    cleaned_retriever = (
+        RunnableLambda(lambda x: x["input"]) 
+        | retriever 
+        | RunnableLambda(clean_retrieved_docs)
+    )
+    
     document_chain = create_stuff_documents_chain(
         llm=llm, 
         prompt=prompt,
         document_prompt=document_prompt 
     )
     
-    retrieval_chain = create_retrieval_chain(retriever, document_chain)
+    retrieval_chain = create_retrieval_chain(cleaned_retriever, document_chain)
     return retrieval_chain
+
 
 # --- Main App Logic ---
 st.title("Hierarchical RAG for Academic Documents")
 st.markdown("Search across papers. The AI will automatically route using metadata titles instead of generic filenames.")
 
-# Fetch both the database AND the list of valid titles
 vectorstore, unique_titles, corpus_docs = load_vectorstore_and_titles()
 
 if not vectorstore:
@@ -194,35 +207,22 @@ if st.button("Search & Generate") and query:
     else:
         with st.spinner("Analyzing query and extracting routing filters..."):
             try:
-                # 1. Initialize Groq Client
                 llm = ChatGroq(temperature=0.0, api_key=SecretStr(groq_api_key), model=model_name)
                 
-                # 2. The Intelligent Router Step
-                # Dynamically inject the exact database titles into the Router's instructions
                 valid_titles_str = "\n".join([f"- {t}" for t in unique_titles])
                 router_system_prompt = f"""You are an intelligent routing agent. Your job is to extract the target paper title from the user's query.
                 You MUST select EXACTLY from this list of valid paper titles (or return None if the query is general):
                 {valid_titles_str}
                 """
                 
-                router_prompt = ChatPromptTemplate.from_messages(
-                    [
-                        ("system", router_system_prompt),
-                        ("user", "{query}"),
-                    ]
-                )
-                
+                router_prompt = ChatPromptTemplate.from_messages([("system", router_system_prompt), ("user", "{query}")])
                 structured_llm = router_prompt | llm.with_structured_output(SearchFilters)
                 extracted_filters = structured_llm.invoke({"query": query})
                 
-                # --- 3. DYNAMIC METADATA FILTER LOGIC ---
                 chroma_filter = {}
-
-                # If the AI successfully picked a known title from the DB
                 if extracted_filters.target_title and extracted_filters.target_title in unique_titles:
                     chroma_filter["title"] = extracted_filters.target_title 
 
-                # Configure initial search kwargs
                 search_kwargs: dict[str, Any] = {"k": 10} 
                 if chroma_filter:
                     search_kwargs["filter"] = chroma_filter 
@@ -230,52 +230,21 @@ if st.button("Search & Generate") and query:
                 else:
                     st.info("🤖 Executing global hybrid retrieval (vector + lexical).")
                     
-                # --- THE SAFETY NET ---
                 test_retriever = vectorstore.as_retriever(search_kwargs={"k": 1, "filter": chroma_filter})
                 if chroma_filter and len(test_retriever.invoke(query)) == 0:
                     st.warning(f"⚠️ Could not find exact match for {chroma_filter} in database. Falling back to global search...")
                     search_kwargs.pop("filter", None)
-                # ----------------------------------------
                 
-                # 4. Create the Chain and generate
                 with st.spinner("Executing hybrid retrieval and generating answer..."):
                     chain = build_chain(llm, vectorstore, corpus_docs, search_kwargs)
                     response = chain.invoke({"input": query})
                 
-                # 5. Display Results
-                source_rows: list[tuple[Document, str, str]] = []
-                unique_paths: list[str] = []
-
-                for doc in response["context"]:
-                    subsection_value = doc.metadata.get("path_level_3") or doc.metadata.get("subsection")
-                    section_display = doc.metadata.get("section", "Main Text")
-                    if subsection_value:
-                        section_display = f"{section_display} -> {subsection_value}"
-
-                    path_display = doc.metadata.get("hierarchy_path")
-                    if not path_display:
-                        title_value = doc.metadata.get("title") or doc.metadata.get("path_level_1") or "Unknown Title"
-                        path_display = f"{title_value} -> {section_display}"
-
-                    source_rows.append((doc, section_display, path_display))
-                    if path_display not in unique_paths:
-                        unique_paths.append(path_display)
-
-                st.markdown("### Retrieved Path")
-                if unique_paths:
-                    st.info(unique_paths[0])
-                else:
-                    st.info("No path available from retrieved context.")
-
                 st.markdown("### Answer")
                 st.write(response["answer"])
                 
                 st.markdown("### Source Evidence Retrieved")
-                for i, (doc, section_display, path_display) in enumerate(source_rows):
-
-                    # Include path directly in the visible source row (expander title).
-                    with st.expander(f"Source {i+1}: {doc.metadata.get('title', 'Unknown Title')} | Path: {path_display}"):
-                        st.caption(f"Path: {path_display}")
+                for i, doc in enumerate(response["context"]):
+                    with st.expander(f"Source {i+1}: {doc.metadata.get('title', 'Unknown Title')} | Path: {doc.metadata.get('hierarchy_path', 'Main Text')}"):
                         st.json(doc.metadata)  
                         st.write(doc.page_content) 
                         
