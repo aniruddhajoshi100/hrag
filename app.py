@@ -243,18 +243,39 @@ if st.button("Search & Generate") and query:
                     response = chain.invoke({"input": query})
                 
                 # 5. Display Results
-                st.markdown("### Answer")
-                st.write(response["answer"])
-                
-                st.markdown("### Source Evidence Retrieved")
-                for i, doc in enumerate(response["context"]):
+                source_rows: list[tuple[Document, str, str]] = []
+                unique_paths: list[str] = []
+
+                for doc in response["context"]:
                     subsection_value = doc.metadata.get("path_level_3") or doc.metadata.get("subsection")
                     section_display = doc.metadata.get("section", "Main Text")
                     if subsection_value:
                         section_display = f"{section_display} -> {subsection_value}"
 
-                    # Show the actual title instead of 'p1.pdf' in the UI expander
-                    with st.expander(f"Source {i+1}: {doc.metadata.get('title', 'Unknown Title')} | Section: {section_display}"):
+                    path_display = doc.metadata.get("hierarchy_path")
+                    if not path_display:
+                        title_value = doc.metadata.get("title") or doc.metadata.get("path_level_1") or "Unknown Title"
+                        path_display = f"{title_value} -> {section_display}"
+
+                    source_rows.append((doc, section_display, path_display))
+                    if path_display not in unique_paths:
+                        unique_paths.append(path_display)
+
+                st.markdown("### Retrieved Path")
+                if unique_paths:
+                    st.info(unique_paths[0])
+                else:
+                    st.info("No path available from retrieved context.")
+
+                st.markdown("### Answer")
+                st.write(response["answer"])
+                
+                st.markdown("### Source Evidence Retrieved")
+                for i, (doc, section_display, path_display) in enumerate(source_rows):
+
+                    # Include path directly in the visible source row (expander title).
+                    with st.expander(f"Source {i+1}: {doc.metadata.get('title', 'Unknown Title')} | Path: {path_display}"):
+                        st.caption(f"Path: {path_display}")
                         st.json(doc.metadata)  
                         st.write(doc.page_content) 
                         

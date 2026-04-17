@@ -267,6 +267,28 @@ def _print_answer_block(title: str, answer: str, width: int = 110) -> None:
         for line in wrapped:
             print(f"  {line}")
 
+
+def _print_retrieved_paths(title: str, response_payload: dict[str, Any]) -> None:
+    print(f"{title}:")
+    docs = response_payload.get("context", []) if isinstance(response_payload, dict) else []
+    if not docs:
+        print("  [no retrieved context]")
+        return
+
+    for idx, doc in enumerate(docs, start=1):
+        metadata = doc.metadata if hasattr(doc, "metadata") else {}
+        path_value = metadata.get("hierarchy_path")
+        if not path_value:
+            title_value = metadata.get("title") or metadata.get("path_level_1") or "Unknown Title"
+            section_value = metadata.get("section") or metadata.get("path_level_2") or "Main Text"
+            subsection_value = metadata.get("path_level_3") or metadata.get("subsection")
+            path_parts = [str(title_value), str(section_value)]
+            if subsection_value:
+                path_parts.append(str(subsection_value))
+            path_value = " -> ".join(path_parts)
+
+        print(f"  {idx}. {path_value}")
+
 def evaluate():
     print("Starting Comparison Evaluation...\n")
     print("=" * 80)
@@ -282,12 +304,14 @@ def evaluate():
         res_naive, time_naive = run_naive_rag(q)
         ans_n = res_naive["answer"]
         _print_answer_block("Naive Answer", ans_n)
+        _print_retrieved_paths("Naive Retrieved Paths", res_naive)
         print(f"  Time: {time_naive:.2f}s\n")
         
         # NOVEL
         res_novel, time_novel, filters = run_novel_rag(q)
         ans_nov = res_novel["answer"]
         _print_answer_block("Novel Answer", ans_nov)
+        _print_retrieved_paths("Novel Retrieved Paths", res_novel)
         print(f"  Filter Extracted: {filters}")
         print(f"  Time: {time_novel:.2f}s\n")
         print("=" * 80)
